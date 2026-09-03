@@ -1,9 +1,46 @@
-try { require("dotenv").config(); } catch {}
+try { require("dotenv").config({ quiet: true }); } catch {}
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+
+// ─── Terminal styling (zero deps — NO_COLOR / CI aware) ──────────────────────
+const SUPPORTS_COLOR =
+  !process.env.NO_COLOR &&
+  !process.env.CI &&
+  process.stdout.isTTY !== false;
+
+const ESC = SUPPORTS_COLOR
+  ? { reset:"\x1b[0m", bold:"\x1b[1m", dim:"\x1b[2m",
+      cyan:"\x1b[36m", green:"\x1b[32m", yellow:"\x1b[33m", red:"\x1b[31m" }
+  : Object.fromEntries(
+      ["reset","bold","dim","cyan","green","yellow","red"].map((k) => [k, ""])
+    );
+
+function styled(code, text) {
+  return SUPPORTS_COLOR ? `${code}${text}${ESC.reset}` : text;
+}
+const clrBold   = (t) => styled(ESC.bold,   t);
+const clrDim    = (t) => styled(ESC.dim,    t);
+const clrCyan   = (t) => styled(ESC.cyan,   t);
+const clrGreen  = (t) => styled(ESC.green,  t);
+const clrYellow = (t) => styled(ESC.yellow, t);
+const clrRed    = (t) => styled(ESC.red,    t);
+
+function formatDuration(ms) {
+  if (ms >= 60000) return `${(ms / 60000).toFixed(1)}m`;
+  if (ms >= 1000)  return `${(ms / 1000).toFixed(1)}s`;
+  return `${ms}ms`;
+}
+
+function formatTimestamp() {
+  const d = new Date();
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((n) => String(n).padStart(2, "0"))
+    .join(":");
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1";
 const DEFAULT_MODELS = ["muse-spark-1.2-contributor-free"];
@@ -531,11 +568,6 @@ function shouldSendReasoningContent(model) {
   const mode = String(CONFIG.reasoningContentMode || "auto").toLowerCase();
   if (["always", "true", "on"].includes(mode)) return true;
   if (["never", "false", "off", "none"].includes(mode)) return false;
-  return isReasoningModel(model);
-}
-
-function isDeepSeekModel(model) {
-  // Legacy alias - use isReasoningModel
   return isReasoningModel(model);
 }
 
@@ -1115,25 +1147,41 @@ function normalizeUpstreamError(error, upstreamContext) {
 }
 
 function payloadDebugSummary(payload) {
-  const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
-  return {
+  // Chat Completions uses payload.messages; Responses API uses payload.input.
+  const isResponsesPayload = Array.isArray(payload && payload.input);
+  const messages = isResponsesPayload
+    ? payload.input
+    : Array.isArray(payload && payload.messages) ? payload.messages : [];
+
+  const summary = {
     model: payload && payload.model,
+    api: isResponsesPayload ? "responses" : "chat_completions",
     stream: Boolean(payload && payload.stream),
     message_count: messages.length,
-    messages: messages.map((message, index) => {
-      const toolCalls = Array.isArray(message && message.tool_calls) ? message.tool_calls : [];
-      const summary = {
-        index,
-        role: message && message.role,
-      };
-      if (message && message.name) summary.name = message.name;
-      if (message && message.tool_call_id) summary.tool_call_id = message.tool_call_id;
-      if (toolCalls.length) {
-        summary.tool_call_ids = toolCalls.map((call) => call && call.id).filter(Boolean);
-      }
-      return summary;
-    }),
   };
+
+  if (isResponsesPayload) {
+    // Responses API: payload.input items have role + content[]
+    summary.input = messages.map((item, index) => ({
+      index,
+      role: item && item.role,
+      content_count: Array.isArray(item && item.content) ? item.content.length : 0,
+    }));
+  } else {
+    // Chat Completions: payload.messages items have role + tool_calls
+    summary.messages = messages.map((message, index) => {
+      const toolCalls = Array.isArray(message && message.tool_calls) ? message.tool_calls : [];
+      const item = { index, role: message && message.role };
+      if (message && message.name) item.name = message.name;
+      if (message && message.tool_call_id) item.tool_call_id = message.tool_call_id;
+      if (toolCalls.length) {
+        item.tool_call_ids = toolCalls.map((call) => call && call.id).filter(Boolean);
+      }
+      return item;
+    });
+  }
+
+  return summary;
 }
 
 function isLoopbackAddress(address) {
@@ -1151,25 +1199,24 @@ function requestProcessShutdown(server) {
 }
 
 async function callOpenCode(req, payload, upstreamContext, opts = {}) {
-  // Global proxy: .env OPENCODE_API_KEY is source of truth
-  let upstreamApiKey = CONFIG.opencodeKey || process.env.OPENCODE_API_KEY || process.env.ANTHROPIC_API_KEY || "";
+  // Global proxy: .env OPENCODE_API_KEY is always preferred.
+  // Client-provided sk-ant- keys are Anthropic keys and will be rejected by opencode.
+  // If no .env key is configured, fall back to whatever the client sent.
   const clientKey = requestAuthToken(req);
-  if (!upstreamApiKey) upstreamApiKey = clientKey;
-  if (clientKey && clientKey.startsWith("sk-ant-") && CONFIG.opencodeKey) {
-    upstreamApiKey = CONFIG.opencodeKey;
-  }
+  const upstreamApiKey = CONFIG.opencodeKey || clientKey || "";
   if (!upstreamApiKey) {
     throw new Error(
       "Upstream API key is not set. Set OPENCODE_API_KEY in .env or ANTHROPIC_API_KEY in settings.",
     );
   }
-  const keyPreview = upstreamApiKey.length > 12 ? `${upstreamApiKey.slice(0,8)}...${upstreamApiKey.slice(-4)} len=${upstreamApiKey.length}` : `len=${upstreamApiKey.length}`;
   const upstreamPathResolved = opts.upstreamPath || "/chat/completions";
-  // If .env ENDPOINT is full URL (contains /responses or /chat), use it directly
+  // If .env ENDPOINT is full URL (contains /responses or /chat), use it directly.
+  // NOTE: When ENDPOINT is a full URL, model-based auto-routing (resolveUpstreamPath /
+  // isResponsesModel) is bypassed — all models hit the single ENDPOINT URL regardless.
   const fullUpstreamUrl = CONFIG.upstreamEndpoint && CONFIG.upstreamEndpoint.startsWith("http") && (CONFIG.upstreamEndpoint.includes("/responses") || CONFIG.upstreamEndpoint.includes("/chat"))
     ? CONFIG.upstreamEndpoint
     : `${CONFIG.upstreamBaseUrl}${upstreamPathResolved}`;
-  console.log(`[auth] upstream key: ${keyPreview} url=${fullUpstreamUrl} model=${payload.model || "?"}`);
+  console.log(`[upstream] key: set len=${upstreamApiKey.length} url=${fullUpstreamUrl} model=${payload.model || "?"}`);
   const response = await fetch(fullUpstreamUrl, {
     method: "POST",
     headers: {
@@ -1188,6 +1235,7 @@ async function callOpenCode(req, payload, upstreamContext, opts = {}) {
     console.error(`Upstream payload summary: ${JSON.stringify(payloadDebugSummary(payload))} path=${upstreamPathResolved}`);
     const error = new Error(`OpenCode Go returned ${response.status}: ${text}`);
     error.status = response.status;
+    error.type = response.status >= 500 ? "proxy_error" : "upstream_error";
     throw error;
   }
 
@@ -1257,17 +1305,40 @@ function truncateForLog(value, maxLength = 500) {
 }
 
 function requestLabel(req) {
+  // Kept for internal error message construction — display uses logRequest/logRequestError.
   return `${req.method || "?"} ${req.url || "?"}`;
 }
 
+function parsedPathname(req) {
+  try { return new URL(req.url || "/", "http://x").pathname; } catch { return req.url || "/"; }
+}
+
 function logRequest(req, res, startedAt) {
-  const durationMs = Date.now() - startedAt;
-  console.log(`${requestLabel(req)} -> ${res.statusCode} ${durationMs}ms`);
+  const ms = Date.now() - startedAt;
+  const status = res.statusCode;
+  const method = (req.method || "?").padEnd(5);
+  const pathname = parsedPathname(req).padEnd(22);
+
+  const icon = status >= 500 ? clrRed("✖") : status >= 400 ? clrYellow("–") : clrGreen("✔");
+  const coloredStatus =
+    status >= 500 ? clrRed(String(status)) :
+    status >= 400 ? clrYellow(String(status)) :
+    clrGreen(String(status));
+
+  console.log(
+    `${clrDim(formatTimestamp())}  ${icon}  ${clrBold(method)}${clrDim(pathname)} ` +
+    `${coloredStatus}  ${clrDim(formatDuration(ms))}`
+  );
 }
 
 function logRequestError(req, status, error) {
   const message = error && error.message ? error.message : String(error);
-  console.error(`${requestLabel(req)} failed with ${status}: ${message}`);
+  const method  = (req.method || "?").padEnd(5);
+  const pathname = parsedPathname(req).padEnd(22);
+  console.error(
+    `${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrBold(method)}${clrDim(pathname)} ` +
+    `${clrRed(String(status))}  ${clrDim(message)}`
+  );
 }
 
 function upstreamResponseHeaders(headers) {
@@ -1543,9 +1614,13 @@ async function streamOpenAiAsAnthropic(upstream, res, model, toolContextParts = 
 
 async function handleMessages(req, res) {
   const body = await readJsonBody(req);
-  // Global proxy: override model with .env MODEL if set
+  // Global proxy: override model with .env MODEL if set.
+  // Claude Code always sends its own model name; .env MODEL silently wins every request.
+  // Log only in debug mode to avoid noise on every request.
   if (CONFIG.primaryModel && body.model !== CONFIG.primaryModel) {
-    console.log(`[model] override ${body.model} → ${CONFIG.primaryModel} (from .env)`);
+    if (process.env.CLAUDE_OPENCODE_DEBUG) {
+      console.log(`[model] override ${body.model} → ${CONFIG.primaryModel} (from .env)`);
+    }
     body.model = CONFIG.primaryModel;
   }
   const wantsStream = body.stream === true;
@@ -1558,11 +1633,29 @@ async function handleMessages(req, res) {
   try {
     if (useResponses) {
       const payload = anthropicToResponses(body, false);
+      // Guard: opencode returns 500 when input is empty. Return 400 early with a clear message.
+      if (!Array.isArray(payload.input) || payload.input.length === 0) {
+        const err = new Error("Responses API input is empty after translation — no user messages found.");
+        err.status = 400;
+        err.type = "invalid_request_error";
+        throw err;
+      }
       upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
-      const respBody = await upstream.json();
+      let respBody;
+      try {
+        respBody = await upstream.json();
+      } catch (parseErr) {
+        const err = new Error(`Upstream returned non-JSON response: ${parseErr.message}`);
+        err.status = 502;
+        err.type = "proxy_error";
+        throw err;
+      }
       const anthropicBody = responsesToAnthropic(respBody, body.model, toolContextParts);
       if (wantsStream) {
-        // Simulate streaming for Responses API (upstream is non-streaming)
+        // Simulate streaming for Responses API (upstream is always non-streaming here).
+        // Trade-off: the full upstream response is buffered before any SSE event is emitted,
+        // so time-to-first-token is higher than a true streaming path. This is a known
+        // limitation of the Responses API — it does not support streaming in this bridge.
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache",
@@ -1599,6 +1692,14 @@ async function handleMessages(req, res) {
 
     // Legacy chat/completions path
     const payload = anthropicToOpenAi(body, wantsStream);
+    // Guard: some upstreams return 400/500 when messages is empty or has only a system message.
+    const nonSystemMessages = (payload.messages || []).filter((m) => m.role !== "system");
+    if (nonSystemMessages.length === 0) {
+      const err = new Error("Chat Completions messages is empty after translation — no user or assistant messages found.");
+      err.status = 400;
+      err.type = "invalid_request_error";
+      throw err;
+    }
     upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
 
     if (wantsStream) {
@@ -1626,9 +1727,16 @@ async function handleChatCompletions(req, res) {
     upstream = await callOpenCode(req, body, upstreamContext, { upstreamPath });
     res.writeHead(upstream.status, upstreamResponseHeaders(upstream.headers));
     if (upstream.body) {
-      for await (const chunk of upstream.body) res.write(chunk);
+      try {
+        for await (const chunk of upstream.body) {
+          if (!res.writableEnded && !res.destroyed) res.write(chunk);
+        }
+      } catch (streamErr) {
+        // Client likely disconnected — log and fall through to res.end()
+        console.error(`handleChatCompletions stream error: ${streamErr.message}`);
+      }
     }
-    res.end();
+    if (!res.writableEnded && !res.destroyed) res.end();
   } catch (error) {
     throw normalizeUpstreamError(error, upstreamContext);
   } finally {
@@ -1725,16 +1833,80 @@ function installShutdownHandlers(server) {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("beforeExit", flushReasoningCache);
+
+  // Catch synchronous throws that escape all try/catch blocks.
+  // Flush the reasoning cache so in-flight reasoning isn't lost before dying.
+  process.on("uncaughtException", (error) => {
+    console.error(`[fatal] Uncaught exception: ${error && error.message ? error.message : error}`);
+    console.error(error && error.stack ? error.stack : "");
+    flushReasoningCache();
+    process.exit(1);
+  });
+
+  // Catch unhandled Promise rejections (async throws with no .catch()).
+  process.on("unhandledRejection", (reason) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    console.error(`[fatal] Unhandled promise rejection: ${message}`);
+    if (reason instanceof Error && reason.stack) console.error(reason.stack);
+    // Do NOT exit — Node.js >= 15 exits automatically on unhandledRejection.
+    // Logging here ensures it is always captured before the default exit.
+  });
+}
+
+function printBanner() {
+  const effectiveUpstream = CONFIG.upstreamEndpoint
+    ? CONFIG.upstreamEndpoint
+    : `${CONFIG.upstreamBaseUrl}${resolveUpstreamPath(CONFIG.primaryModel, CONFIG.endpointMode)}`;
+  const mode = isResponsesModel(CONFIG.primaryModel) ? "responses" : "chat_completions";
+  const overrideNote = CONFIG.upstreamEndpoint ? clrYellow(" [ENDPOINT override active]") : "";
+  const isDev = process.env.npm_lifecycle_event === "dev" || process.argv.includes("--watch");
+
+  console.log("");
+  console.log(clrCyan("  ╔══════════════════════════════════════════════════════════╗"));
+  console.log(clrCyan("  ║") + clrBold("   ⚡ Claude ↔ OpenCode Proxy           v0.3.0            ") + clrCyan("║"));
+  console.log(clrCyan("  ╚══════════════════════════════════════════════════════════╝"));
+  console.log("");
+  console.log(`   ${clrDim("✦  Status   ")} ${clrGreen(clrBold("Ready"))}`);
+  console.log(`   ${clrDim("✦  Listen   ")} ${clrBold(`http://${CONFIG.listenHost}:${CONFIG.port}`)}`);
+  console.log(`   ${clrDim("✦  Model    ")} ${clrBold(CONFIG.primaryModel)}`);
+  console.log(`   ${clrDim("✦  Upstream ")} ${clrBold(effectiveUpstream)}`);
+  console.log(`   ${clrDim("✦  Mode     ")} ${clrBold(mode)}${overrideNote}`);
+  console.log(`   ${clrDim("✦  Config   ")} ${clrDim(CONFIG.configPath)}`);
+  if (isDev) {
+    console.log("");
+    console.log(`   ${clrYellow("⚡ Dev mode active")} ${clrDim("(auto-restart on .env or server.js change)")}`);
+  }
+  console.log("");
+  console.log(clrDim("  ────────────────────────────────────────────────────────────"));
+  console.log("");
 }
 
 function startServer() {
   loadReasoningCache();
   const server = createServer();
   installShutdownHandlers(server);
+
+  // Handle port-in-use and other listen errors with a clear message.
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(
+        `${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Port ${CONFIG.port} is already in use. Is another instance running?`)}\n` +
+        `       ${clrDim(`Change CLAUDE_OPENCODE_PROXY_PORT in .env to use a different port.`)}`
+      );
+    } else if (error.code === "EACCES") {
+      console.error(
+        `${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Permission denied to listen on port ${CONFIG.port}.`)}\n` +
+        `       ${clrDim(`Use a port > 1024 or run with elevated privileges.`)}`
+      );
+    } else {
+      console.error(`${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Server error: ${error.message}`)}`);
+    }
+    flushReasoningCache();
+    process.exit(1);
+  });
+
   server.listen(CONFIG.port, CONFIG.listenHost, () => {
-    console.log(`DeepSeek V4 OpenCode Claude Code bridge listening on http://${CONFIG.listenHost}:${CONFIG.port}`);
-    console.log(`Config: ${CONFIG.configPath}`);
-    console.log(`Upstream: ${CONFIG.upstreamBaseUrl}/chat/completions`);
+    printBanner();
   });
   return server;
 }

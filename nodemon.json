@@ -1,0 +1,12 @@
+{
+  "watch": ["server.js", ".env"],
+  "ignore": [
+    "*.cache.json",
+    "*.tmp",
+    "node_modules",
+    "test"
+  ],
+  "delay": 300,
+  "exec": "node server.js",
+  "verbose": false
+}
