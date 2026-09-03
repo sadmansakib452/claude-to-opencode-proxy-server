@@ -6,7 +6,7 @@ const os = require("os");
 const path = require("path");
 
 const DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1";
-const DEFAULT_MODELS = ["deepseek-v4-pro[1m]", "deepseek-v4-flash"];
+const DEFAULT_MODELS = ["muse-spark-1.2-contributor-free"];
 const DEFAULT_REASONING_CACHE_PATH = path.join(
   os.homedir(),
   ".claude",
@@ -531,11 +531,16 @@ function shouldSendReasoningContent(model) {
   const mode = String(CONFIG.reasoningContentMode || "auto").toLowerCase();
   if (["always", "true", "on"].includes(mode)) return true;
   if (["never", "false", "off", "none"].includes(mode)) return false;
-  return isDeepSeekModel(model);
+  return isReasoningModel(model);
 }
 
 function isDeepSeekModel(model) {
-  return typeof model === "string" && /(^|[-_/])deepseek/i.test(model);
+  // Legacy alias - use isReasoningModel
+  return isReasoningModel(model);
+}
+
+function isReasoningModel(model) {
+  return typeof model === "string" && /(deepseek|muse-spark|mimo|grok|gpt-5|claude)/i.test(model);
 }
 
 function anthropicMessagesToOpenAi(messages, includeReasoningContent) {
@@ -761,8 +766,8 @@ function anthropicToolChoiceToOpenAi(choice, model) {
   if (!choice || typeof choice !== "object") return undefined;
   if (choice.type === "auto") return "auto";
   if (choice.type === "none") return "none";
-  if (isDeepSeekModel(model)) {
-    // DeepSeek reasoner rejects forced function tool_choice, so any/tool are
+  if (isReasoningModel(model)) {
+    // Reasoning models reject forced function tool_choice, so any/tool are
     // converted to system instructions instead.
     return undefined;
   }
@@ -775,7 +780,7 @@ function anthropicToolChoiceToOpenAi(choice, model) {
 
 function toolChoiceInstruction(choice, model) {
   if (!choice || typeof choice !== "object") return null;
-  if (!isDeepSeekModel(model)) return null;
+  if (!isReasoningModel(model)) return null;
   if (choice.type === "any") {
     return "The caller requires a tool call for this turn. Call one of the available tools instead of answering directly.";
   }
@@ -809,7 +814,7 @@ function reasoningEffortToOpenAi(outputConfig) {
 
 function anthropicToOpenAi(body, stream) {
   const messages = [];
-  const sendDeepSeekExtensions = isDeepSeekModel(body.model);
+  const sendReasoningExtensions = isReasoningModel(body.model);
   const extraSystem = toolChoiceInstruction(body.tool_choice, body.model);
   const system = [systemToOpenAi(body.system), extraSystem].filter(Boolean).join("\n\n");
   if (system) messages.push({ role: "system", content: system });
@@ -825,8 +830,8 @@ function anthropicToOpenAi(body, stream) {
     stop: body.stop_sequences,
     tools: anthropicToolsToOpenAi(body.tools),
     tool_choice: anthropicToolChoiceToOpenAi(body.tool_choice, body.model),
-    thinking: sendDeepSeekExtensions ? thinkingToOpenAi(body.thinking) : undefined,
-    reasoning_effort: sendDeepSeekExtensions ? reasoningEffortToOpenAi(body.output_config) : undefined,
+    thinking: sendReasoningExtensions ? thinkingToOpenAi(body.thinking) : undefined,
+    reasoning_effort: sendReasoningExtensions ? reasoningEffortToOpenAi(body.output_config) : undefined,
     stream_options: stream ? { include_usage: true } : undefined,
   };
 
