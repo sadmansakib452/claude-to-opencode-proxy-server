@@ -85,31 +85,29 @@ function envValue(name, fallback) {
 }
 
 function loadConfig() {
+  // No config.json - .env is source of truth, file is optional fallback for legacy
   const defaultPath = path.join(__dirname, "config.json");
   const configPath = process.env.CLAUDE_OPENCODE_PROXY_CONFIG || argValue("--config") || defaultPath;
   const resolvedPath = path.resolve(configPath);
-  const fileConfig = readJson(resolvedPath) || {};
+  let fileConfig = {};
+  try { fileConfig = readJson(resolvedPath) || {}; } catch { fileConfig = {}; }
   const configDir = path.dirname(resolvedPath);
 
   return {
     configPath: resolvedPath,
-    listenHost:
-      envValue("CLAUDE_OPENCODE_PROXY_HOST", configValue(fileConfig, ["listen", "host"], "127.0.0.1")),
+    listenHost: envValue("CLAUDE_OPENCODE_PROXY_HOST", configValue(fileConfig, ["listen", "host"], "127.0.0.1")),
     port: numberConfig(
       "listen.port",
       envValue("CLAUDE_OPENCODE_PROXY_PORT", configValue(fileConfig, ["listen", "port"], 8787)),
       8787,
       { integer: true, min: 1, max: 65535 },
     ),
-    // ENDPOINT is full URL, BASE_URL is base (legacy). ENDPOINT takes precedence.
+    // ENDPOINT is full URL (from .env), BASE_URL is base
     upstreamEndpoint: envValue("ENDPOINT", "") || "",
     upstreamBaseUrl: normalizeBaseUrl(
-      envValue(
-        "CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL",
-        envValue("BASE_URL", configValue(fileConfig, ["upstream", "baseUrl"], DEFAULT_BASE_URL)),
-      ),
+      envValue("CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL", envValue("BASE_URL", configValue(fileConfig, ["upstream", "baseUrl"], DEFAULT_BASE_URL))),
     ),
-    // Simple .env overrides: MODEL, OPENCODE_API_KEY
+    // .env is primary: MODEL, OPENCODE_API_KEY
     primaryModel: envValue("MODEL", Array.isArray(fileConfig.models) && fileConfig.models[0] ? fileConfig.models[0] : DEFAULT_MODELS[0]),
     opencodeKey: envValue("OPENCODE_API_KEY", envValue("ANTHROPIC_API_KEY", "")),
     reasoningCachePath: resolveMaybeRelative(
