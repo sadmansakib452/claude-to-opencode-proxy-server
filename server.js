@@ -1853,6 +1853,27 @@ function installShutdownHandlers(server) {
   });
 }
 
+function detectClaudeConfigState(port) {
+  try {
+    const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+    if (!fs.existsSync(settingsPath)) {
+      return { state: "fresh", label: "No Claude config found" };
+    }
+    const raw = fs.readFileSync(settingsPath, "utf8");
+    const data = JSON.parse(raw);
+    const currentUrl = (data.env && data.env.ANTHROPIC_BASE_URL) || data.ANTHROPIC_BASE_URL || null;
+    if (currentUrl && currentUrl.includes(String(port))) {
+      return { state: "linked", label: "Linked to this proxy (~/.claude/settings.json)" };
+    }
+    return {
+      state: "unlinked",
+      label: currentUrl ? `Custom API (${currentUrl})` : "Official Claude API (Not linked to proxy)",
+    };
+  } catch {
+    return { state: "unknown", label: "Unable to inspect ~/.claude/settings.json" };
+  }
+}
+
 function printBanner() {
   const effectiveUpstream = CONFIG.upstreamEndpoint
     ? CONFIG.upstreamEndpoint
@@ -1860,6 +1881,7 @@ function printBanner() {
   const mode = isResponsesModel(CONFIG.primaryModel) ? "responses" : "chat_completions";
   const overrideNote = CONFIG.upstreamEndpoint ? clrYellow(" [ENDPOINT override active]") : "";
   const isDev = process.env.npm_lifecycle_event === "dev" || process.argv.includes("--watch");
+  const claudeState = detectClaudeConfigState(CONFIG.port);
 
   console.log("");
   console.log(clrCyan("  ╔══════════════════════════════════════════════════════════╗"));
@@ -1872,10 +1894,28 @@ function printBanner() {
   console.log(`   ${clrDim("✦  Upstream ")} ${clrBold(effectiveUpstream)}`);
   console.log(`   ${clrDim("✦  Mode     ")} ${clrBold(mode)}${overrideNote}`);
   console.log(`   ${clrDim("✦  Config   ")} ${clrDim(CONFIG.configPath)}`);
+
+  if (claudeState.state === "linked") {
+    console.log(`   ${clrDim("✦  Claude   ")} ${clrGreen("✔ " + claudeState.label)}`);
+  } else if (claudeState.state === "unlinked") {
+    console.log(`   ${clrDim("✦  Claude   ")} ${clrYellow("⚠️ " + claudeState.label)}`);
+  } else {
+    console.log(`   ${clrDim("✦  Claude   ")} ${clrDim("ℹ️ " + claudeState.label)}`);
+  }
+
   if (isDev) {
     console.log("");
     console.log(`   ${clrYellow("⚡ Dev mode active")} ${clrDim("(auto-restart on .env or server.js change)")}`);
   }
+
+  if (claudeState.state !== "linked") {
+    console.log("");
+    console.log(`   ${clrYellow("👉 Recommendation:")} Run ${clrBold("npm run setup")} to connect Claude to this proxy`);
+  } else {
+    console.log("");
+    console.log(`   ${clrDim("💡 Tip:")} Run ${clrBold("npm run restore")} anytime to switch back to Official Claude`);
+  }
+
   console.log("");
   console.log(clrDim("  ────────────────────────────────────────────────────────────"));
   console.log("");

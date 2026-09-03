@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon",
+    "setup": "node scripts/setup.js",
+    "restore": "node scripts/setup.js --restore",
+    "status": "node scripts/setup.js --status",
     "check": "node --check server.js",
     "test": "node --test",
     "autostart:install:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-autostart-windows.ps1",
