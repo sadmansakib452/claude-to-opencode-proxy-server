@@ -1,9 +1,17 @@
-# DeepSeek V4 OpenCode Claude Code Bridge
+# Claude to Opencode Proxy Server
+
+> **Global Proxy — Simple .env (3 fields) — No Project Dependency**
+> ```env
+> OPENCODE_API_KEY=sk-your-key
+> MODEL=muse-spark-1.2-contributor-free
+> BASE_URL=https://opencode.ai/zen/v1
+> ```
+> Set once in `.env` → all projects via `~/.claude/settings.json` → `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` → proxy owns key+model. Change `.env` → `npm start` → done.
 
 Languages: [English](README.md) | [简体中文](README.zh-CN.md)
 
 DeepSeek V4 OpenCode Claude Code Bridge is a local compatibility bridge for using
-OpenCode Go's DeepSeek V4 series as a Claude Code backend.
+OpenCode Go's DeepSeek V4 series as a Claude Code backend. Now supports **hybrid mode**: `chat/completions` (deepseek, glm, kimi) + `responses` (muse-spark, gpt-5, grok) with global `.env`.
 
 Claude Code sends Anthropic `/v1/messages` requests. OpenCode Go exposes
 DeepSeek V4 through OpenAI-compatible `/v1/chat/completions`. This proxy
