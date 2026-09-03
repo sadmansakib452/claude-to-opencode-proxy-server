@@ -4,7 +4,7 @@
   "description": "Claude Code to Opencode bridge - global proxy with simple .env (model + key + baseUrl).",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js --config ./config.json",
+    "start": "node server.js",
     "check": "node --check server.js",
     "test": "node --test",
     "autostart:install:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-autostart-windows.ps1",

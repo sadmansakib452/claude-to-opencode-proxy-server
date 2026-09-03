@@ -101,6 +101,8 @@ function loadConfig() {
       8787,
       { integer: true, min: 1, max: 65535 },
     ),
+    // ENDPOINT is full URL, BASE_URL is base (legacy). ENDPOINT takes precedence.
+    upstreamEndpoint: envValue("ENDPOINT", "") || "",
     upstreamBaseUrl: normalizeBaseUrl(
       envValue(
         "CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL",
@@ -880,7 +882,7 @@ function anthropicToOpenAi(body, stream) {
   messages.push(...anthropicMessagesToOpenAi(body.messages, shouldSendReasoningContent(body.model)));
 
   const payload = {
-    model: CONFIG.models.includes(body.model) ? body.model : CONFIG.models[0],
+    model: body.model || CONFIG.primaryModel || CONFIG.models[0],
     messages,
     stream,
     max_tokens: body.max_tokens,
@@ -974,7 +976,7 @@ function anthropicToResponses(body, stream) {
   if (systemText) input.unshift({ role: "system", content: [{ type: "input_text", text: systemText }] });
 
   const payload = {
-    model: CONFIG.models.includes(body.model) ? body.model : CONFIG.models[0],
+    model: body.model || CONFIG.primaryModel || CONFIG.models[0],
     input,
     stream: stream || undefined,
     instructions: undefined,
@@ -1224,8 +1226,12 @@ async function callOpenCode(req, payload, upstreamContext, opts = {}) {
   }
   const keyPreview = upstreamApiKey.length > 12 ? `${upstreamApiKey.slice(0,8)}...${upstreamApiKey.slice(-4)} len=${upstreamApiKey.length}` : `len=${upstreamApiKey.length}`;
   const upstreamPathResolved = opts.upstreamPath || "/chat/completions";
-  console.log(`[auth] upstream key: ${keyPreview} path=${upstreamPathResolved} model=${payload.model || "?"}`);
-  const response = await fetch(`${CONFIG.upstreamBaseUrl}${upstreamPathResolved}`, {
+  // If .env ENDPOINT is full URL (contains /responses or /chat), use it directly
+  const fullUpstreamUrl = CONFIG.upstreamEndpoint && CONFIG.upstreamEndpoint.startsWith("http") && (CONFIG.upstreamEndpoint.includes("/responses") || CONFIG.upstreamEndpoint.includes("/chat"))
+    ? CONFIG.upstreamEndpoint
+    : `${CONFIG.upstreamBaseUrl}${upstreamPathResolved}`;
+  console.log(`[auth] upstream key: ${keyPreview} url=${fullUpstreamUrl} model=${payload.model || "?"}`);
+  const response = await fetch(fullUpstreamUrl, {
     method: "POST",
     headers: {
       authorization: `Bearer ${upstreamApiKey}`,
@@ -1713,8 +1719,8 @@ function createServer() {
           ok: true,
           config: CONFIG.configPath,
           listen: `http://${CONFIG.listenHost}:${CONFIG.port}`,
-          upstream: `${CONFIG.upstreamBaseUrl}/chat/completions`,
-          upstream_key_source: "request",
+          upstream: CONFIG.upstreamEndpoint || `${CONFIG.upstreamBaseUrl}/chat/completions`,
+          upstream_key_source: CONFIG.upstreamEndpoint ? "env ENDPOINT" : "request",
         };
         if (url.searchParams.get("probe") === "upstream") {
           body.upstream_probe = await probeUpstream(req);
