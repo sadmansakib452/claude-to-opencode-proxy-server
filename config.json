@@ -7,13 +7,8 @@
     "baseUrl": "https://opencode.ai/zen/v1"
   },
   "models": [
-    "muse-spark-1.2-contributor-free",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "glm-5",
-    "kimi-k2.6"
+    "muse-spark-1.2-contributor-free"
   ],
-  "endpointMode": "auto",
   "reasoningContent": "auto",
   "reasoningCacheMaxEntries": 0,
   "reasoningCacheMaxAgeMs": 2592000000,

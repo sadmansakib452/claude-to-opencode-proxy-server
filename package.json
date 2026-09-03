@@ -1,7 +1,7 @@
 {
-  "name": "deepseek-v4-opencode-claude-code-bridge",
-  "version": "0.2.1",
-  "description": "DeepSeek V4 on OpenCode Go compatibility bridge for Claude Code.",
+  "name": "claude-to-opencode-proxy-server",
+  "version": "0.3.0",
+  "description": "Claude Code to Opencode bridge - global proxy with simple .env (model + key + baseUrl).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js --config ./config.json",
@@ -26,5 +26,8 @@
   "license": "MIT",
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
   }
 }

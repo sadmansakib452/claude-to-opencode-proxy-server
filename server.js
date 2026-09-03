@@ -1,3 +1,4 @@
+try { require("dotenv").config(); } catch {}
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -103,9 +104,12 @@ function loadConfig() {
     upstreamBaseUrl: normalizeBaseUrl(
       envValue(
         "CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL",
-        configValue(fileConfig, ["upstream", "baseUrl"], DEFAULT_BASE_URL),
+        envValue("BASE_URL", configValue(fileConfig, ["upstream", "baseUrl"], DEFAULT_BASE_URL)),
       ),
     ),
+    // Simple .env overrides: MODEL, OPENCODE_API_KEY
+    primaryModel: envValue("MODEL", Array.isArray(fileConfig.models) && fileConfig.models[0] ? fileConfig.models[0] : DEFAULT_MODELS[0]),
+    opencodeKey: envValue("OPENCODE_API_KEY", envValue("ANTHROPIC_API_KEY", "")),
     reasoningCachePath: resolveMaybeRelative(
       envValue(
         "CLAUDE_OPENCODE_REASONING_CACHE",
@@ -1206,36 +1210,18 @@ function requestProcessShutdown(server) {
 }
 
 async function callOpenCode(req, payload, upstreamContext, opts = {}) {
-  let upstreamApiKey = requestAuthToken(req);
+  // Global proxy: .env OPENCODE_API_KEY is source of truth
+  let upstreamApiKey = CONFIG.opencodeKey || process.env.OPENCODE_API_KEY || process.env.ANTHROPIC_API_KEY || "";
+  const clientKey = requestAuthToken(req);
+  if (!upstreamApiKey) upstreamApiKey = clientKey;
+  if (clientKey && clientKey.startsWith("sk-ant-") && CONFIG.opencodeKey) {
+    upstreamApiKey = CONFIG.opencodeKey;
+  }
   if (!upstreamApiKey) {
     throw new Error(
-      "Upstream API key is not set. Put your OpenCode Go key in Claude Code settings as ANTHROPIC_API_KEY.",
+      "Upstream API key is not set. Set OPENCODE_API_KEY in .env or ANTHROPIC_API_KEY in settings.",
     );
   }
-  // Fallback: VS Code extension may still send Anthropic sk-ant-* from SecretStorage even after `claude auth logout`.
-  // If incoming key looks like Anthropic (sk-ant-*) or len 108, try opencode key from project settings as fallback.
-  if (upstreamApiKey.startsWith("sk-ant-") || upstreamApiKey.length === 108) {
-    try {
-      const fallbackSettings = readJson(path.join(__dirname, "..", "my-router", ".claude", "settings.json")) || readJson(path.join(os.homedir(), "Documents", "codes", "my-router", ".claude", "settings.json"));
-      const fallbackKey = fallbackSettings?.env?.ANTHROPIC_API_KEY;
-      if (fallbackKey && fallbackKey.startsWith("sk-") && !fallbackKey.startsWith("sk-ant-")) {
-        console.log(`[auth] incoming sk-ant-* detected → fallback to opencode key ${fallbackKey.slice(0,8)}... len=${fallbackKey.length}`);
-        upstreamApiKey = fallbackKey;
-      }
-    } catch {}
-    // Also try absolute path for my-router settings
-    if (upstreamApiKey.startsWith("sk-ant-")) {
-      try {
-        const absSettings = readJson("C:\\Users\\sadman\\Documents\\codes\\my-router\\.claude\\settings.json");
-        const absKey = absSettings?.env?.ANTHROPIC_API_KEY;
-        if (absKey && absKey.startsWith("sk-2")) {
-          console.log(`[auth] fallback via absolute path → ${absKey.slice(0,8)}...`);
-          upstreamApiKey = absKey;
-        }
-      } catch {}
-    }
-  }
-  // Debug: log key prefix to diagnose 401 (do not log full key)
   const keyPreview = upstreamApiKey.length > 12 ? `${upstreamApiKey.slice(0,8)}...${upstreamApiKey.slice(-4)} len=${upstreamApiKey.length}` : `len=${upstreamApiKey.length}`;
   const upstreamPathResolved = opts.upstreamPath || "/chat/completions";
   console.log(`[auth] upstream key: ${keyPreview} path=${upstreamPathResolved} model=${payload.model || "?"}`);
@@ -1612,6 +1598,11 @@ async function streamOpenAiAsAnthropic(upstream, res, model, toolContextParts = 
 
 async function handleMessages(req, res) {
   const body = await readJsonBody(req);
+  // Global proxy: override model with .env MODEL if set
+  if (CONFIG.primaryModel && body.model !== CONFIG.primaryModel) {
+    console.log(`[model] override ${body.model} → ${CONFIG.primaryModel} (from .env)`);
+    body.model = CONFIG.primaryModel;
+  }
   const wantsStream = body.stream === true;
   const toolContextParts = currentToolContextParts(body.messages);
   const useResponses = isResponsesModel(body.model);
