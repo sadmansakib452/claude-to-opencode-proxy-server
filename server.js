@@ -85,91 +85,27 @@ function envValue(name, fallback) {
 }
 
 function loadConfig() {
-  // No config.json - .env is source of truth, file is optional fallback for legacy
-  const defaultPath = path.join(__dirname, "config.json");
-  const configPath = process.env.CLAUDE_OPENCODE_PROXY_CONFIG || argValue("--config") || defaultPath;
-  const resolvedPath = path.resolve(configPath);
-  let fileConfig = {};
-  try { fileConfig = readJson(resolvedPath) || {}; } catch { fileConfig = {}; }
-  const configDir = path.dirname(resolvedPath);
-
+  // Source of truth is .env — no config.json
   return {
-    configPath: resolvedPath,
-    listenHost: envValue("CLAUDE_OPENCODE_PROXY_HOST", configValue(fileConfig, ["listen", "host"], "127.0.0.1")),
-    port: numberConfig(
-      "listen.port",
-      envValue("CLAUDE_OPENCODE_PROXY_PORT", configValue(fileConfig, ["listen", "port"], 8787)),
-      8787,
-      { integer: true, min: 1, max: 65535 },
-    ),
-    // ENDPOINT is full URL (from .env), BASE_URL is base
+    configPath: path.join(__dirname, ".env"),
+    listenHost: envValue("CLAUDE_OPENCODE_PROXY_HOST", "127.0.0.1"),
+    port: numberConfig("listen.port", envValue("CLAUDE_OPENCODE_PROXY_PORT", 8787), 8787, { integer: true, min: 1, max: 65535 }),
     upstreamEndpoint: envValue("ENDPOINT", "") || "",
-    upstreamBaseUrl: normalizeBaseUrl(
-      envValue("CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL", envValue("BASE_URL", configValue(fileConfig, ["upstream", "baseUrl"], DEFAULT_BASE_URL))),
-    ),
-    // .env is primary: MODEL, OPENCODE_API_KEY
-    primaryModel: envValue("MODEL", Array.isArray(fileConfig.models) && fileConfig.models[0] ? fileConfig.models[0] : DEFAULT_MODELS[0]),
+    upstreamBaseUrl: normalizeBaseUrl(envValue("CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL", envValue("BASE_URL", DEFAULT_BASE_URL))),
+    primaryModel: envValue("MODEL", DEFAULT_MODELS[0]),
     opencodeKey: envValue("OPENCODE_API_KEY", envValue("ANTHROPIC_API_KEY", "")),
     reasoningCachePath: resolveMaybeRelative(
-      envValue(
-        "CLAUDE_OPENCODE_REASONING_CACHE",
-        configValue(fileConfig, ["reasoningCachePath"], DEFAULT_REASONING_CACHE_PATH),
-      ),
-      configDir,
+      envValue("CLAUDE_OPENCODE_REASONING_CACHE", DEFAULT_REASONING_CACHE_PATH),
+      __dirname,
     ),
-    reasoningCacheMaxEntries: numberConfig(
-      "reasoningCacheMaxEntries",
-      envValue(
-        "CLAUDE_OPENCODE_REASONING_CACHE_MAX_ENTRIES",
-        configValue(fileConfig, ["reasoningCacheMaxEntries"], DEFAULT_REASONING_CACHE_MAX_ENTRIES),
-      ),
-      DEFAULT_REASONING_CACHE_MAX_ENTRIES,
-      { integer: true, min: 0 },
-    ),
-    reasoningCacheMaxAgeMs: numberConfig(
-      "reasoningCacheMaxAgeMs",
-      envValue(
-        "CLAUDE_OPENCODE_REASONING_CACHE_MAX_AGE_MS",
-        configValue(fileConfig, ["reasoningCacheMaxAgeMs"], DEFAULT_REASONING_CACHE_MAX_AGE_MS),
-      ),
-      DEFAULT_REASONING_CACHE_MAX_AGE_MS,
-      { integer: true, min: 0 },
-    ),
-    reasoningCacheMaxSizeBytes: numberConfig(
-      "reasoningCacheMaxSizeBytes",
-      envValue(
-        "CLAUDE_OPENCODE_REASONING_CACHE_MAX_SIZE_BYTES",
-        configValue(fileConfig, ["reasoningCacheMaxSizeBytes"], DEFAULT_REASONING_CACHE_MAX_SIZE_BYTES),
-      ),
-      DEFAULT_REASONING_CACHE_MAX_SIZE_BYTES,
-      { integer: true, min: 0 },
-    ),
-    reasoningContentMode:
-      envValue("CLAUDE_OPENCODE_REASONING_CONTENT", configValue(fileConfig, ["reasoningContent"], "auto")),
-    requestBodyLimitBytes: numberConfig(
-      "requestBodyLimitBytes",
-      envValue(
-        "CLAUDE_OPENCODE_REQUEST_BODY_LIMIT_BYTES",
-        configValue(fileConfig, ["requestBodyLimitBytes"], DEFAULT_REQUEST_BODY_LIMIT_BYTES),
-      ),
-      DEFAULT_REQUEST_BODY_LIMIT_BYTES,
-      { integer: true, min: 1 },
-    ),
-    upstreamTimeoutMs: numberConfig(
-      "upstreamTimeoutMs",
-      envValue(
-        "CLAUDE_OPENCODE_UPSTREAM_TIMEOUT_MS",
-        configValue(fileConfig, ["upstreamTimeoutMs"], DEFAULT_UPSTREAM_TIMEOUT_MS),
-      ),
-      DEFAULT_UPSTREAM_TIMEOUT_MS,
-      { integer: true, min: 0 },
-    ),
-    models: Array.isArray(fileConfig.models) && fileConfig.models.length
-      ? fileConfig.models
-      : DEFAULT_MODELS,
-    endpointMode: String(
-      envValue("CLAUDE_OPENCODE_ENDPOINT_MODE", configValue(fileConfig, ["endpointMode"], "auto")),
-    ).toLowerCase(),
+    reasoningCacheMaxEntries: numberConfig("reasoningCacheMaxEntries", envValue("CLAUDE_OPENCODE_REASONING_CACHE_MAX_ENTRIES", DEFAULT_REASONING_CACHE_MAX_ENTRIES), DEFAULT_REASONING_CACHE_MAX_ENTRIES, { integer: true, min: 0 }),
+    reasoningCacheMaxAgeMs: numberConfig("reasoningCacheMaxAgeMs", envValue("CLAUDE_OPENCODE_REASONING_CACHE_MAX_AGE_MS", DEFAULT_REASONING_CACHE_MAX_AGE_MS), DEFAULT_REASONING_CACHE_MAX_AGE_MS, { integer: true, min: 0 }),
+    reasoningCacheMaxSizeBytes: numberConfig("reasoningCacheMaxSizeBytes", envValue("CLAUDE_OPENCODE_REASONING_CACHE_MAX_SIZE_BYTES", DEFAULT_REASONING_CACHE_MAX_SIZE_BYTES), DEFAULT_REASONING_CACHE_MAX_SIZE_BYTES, { integer: true, min: 0 }),
+    reasoningContentMode: envValue("CLAUDE_OPENCODE_REASONING_CONTENT", "auto"),
+    requestBodyLimitBytes: numberConfig("requestBodyLimitBytes", envValue("CLAUDE_OPENCODE_REQUEST_BODY_LIMIT_BYTES", DEFAULT_REQUEST_BODY_LIMIT_BYTES), DEFAULT_REQUEST_BODY_LIMIT_BYTES, { integer: true, min: 1 }),
+    upstreamTimeoutMs: numberConfig("upstreamTimeoutMs", envValue("CLAUDE_OPENCODE_UPSTREAM_TIMEOUT_MS", DEFAULT_UPSTREAM_TIMEOUT_MS), DEFAULT_UPSTREAM_TIMEOUT_MS, { integer: true, min: 0 }),
+    models: [envValue("MODEL", DEFAULT_MODELS[0])].filter(Boolean),
+    endpointMode: String(envValue("CLAUDE_OPENCODE_ENDPOINT_MODE", "auto")).toLowerCase(),
   };
 }
 
