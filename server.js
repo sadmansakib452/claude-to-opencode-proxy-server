@@ -136,6 +136,25 @@ function parseCommaList(raw) {
     .filter((s) => s.length > 0);
 }
 
+function parseModelDefinition(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes("|")) {
+    const pipeIdx = trimmed.indexOf("|");
+    const model = trimmed.slice(0, pipeIdx).trim();
+    const endpoint = trimmed.slice(pipeIdx + 1).trim();
+    return {
+      model,
+      endpoint: endpoint || null,
+    };
+  }
+  return {
+    model: trimmed,
+    endpoint: null,
+  };
+}
+
 class KeyPool {
   constructor(keys = []) {
     this.keys = Array.isArray(keys) ? [...keys] : [];
@@ -178,17 +197,27 @@ function loadConfig() {
   // Source of truth is .env — no config.json
   const rawKeyString = envValue("OPENCODE_API_KEYS", envValue("OPENCODE_API_KEY", envValue("ANTHROPIC_API_KEY", "")));
   const parsedKeys = parseCommaList(rawKeyString);
-  const primaryModel = envValue("MODEL", DEFAULT_MODELS[0]);
-  const fallbackModels = parseCommaList(envValue("FALLBACK_MODELS", ""));
+  const primaryTarget = parseModelDefinition(envValue("MODEL", DEFAULT_MODELS[0])) || { model: DEFAULT_MODELS[0], endpoint: null };
+  const fallbackTargets = parseCommaList(envValue("FALLBACK_MODELS", "")).map(parseModelDefinition).filter(Boolean);
+  const primaryModel = primaryTarget.model;
+  const fallbackModels = fallbackTargets.map((t) => t.model);
+  const modelEndpoints = new Map();
+  if (primaryTarget.endpoint) modelEndpoints.set(primaryTarget.model, primaryTarget.endpoint);
+  for (const target of fallbackTargets) {
+    if (target.endpoint) modelEndpoints.set(target.model, target.endpoint);
+  }
 
   return {
     configPath: path.join(__dirname, ".env"),
     listenHost: envValue("CLAUDE_OPENCODE_PROXY_HOST", "127.0.0.1"),
     port: numberConfig("listen.port", envValue("CLAUDE_OPENCODE_PROXY_PORT", 8787), 8787, { integer: true, min: 1, max: 65535 }),
-    upstreamEndpoint: envValue("ENDPOINT", "") || "",
+    upstreamEndpoint: primaryTarget.endpoint || envValue("ENDPOINT", "") || "",
     upstreamBaseUrl: normalizeBaseUrl(envValue("CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL", envValue("BASE_URL", DEFAULT_BASE_URL))),
+    primaryTarget,
+    fallbackTargets,
     primaryModel,
     fallbackModels,
+    modelEndpoints,
     opencodeKey: parsedKeys[0] || "",
     opencodeKeys: parsedKeys,
     reasoningCachePath: resolveMaybeRelative(
@@ -1263,7 +1292,10 @@ function requestProcessShutdown(server) {
   });
 }
 
-function resolveFullUpstreamUrl(upstreamPathResolved) {
+function resolveFullUpstreamUrl(upstreamPathResolved, customEndpoint = null) {
+  if (customEndpoint && typeof customEndpoint === "string" && customEndpoint.startsWith("http")) {
+    return customEndpoint;
+  }
   if (CONFIG.upstreamEndpoint && CONFIG.upstreamEndpoint.startsWith("http")) {
     const isEndpointResponses = CONFIG.upstreamEndpoint.includes("/responses");
     const isPathResponses = upstreamPathResolved === "/responses";
@@ -1287,7 +1319,7 @@ async function callOpenCode(req, payload, upstreamContext, opts = {}) {
     );
   }
   const upstreamPathResolved = opts.upstreamPath || "/chat/completions";
-  const fullUpstreamUrl = resolveFullUpstreamUrl(upstreamPathResolved);
+  const fullUpstreamUrl = resolveFullUpstreamUrl(upstreamPathResolved, opts.customEndpoint);
 
   if (process.env.CLAUDE_OPENCODE_DEBUG) {
     console.log(`[upstream] key: set len=${upstreamApiKey.length} url=${fullUpstreamUrl} model=${payload.model || "?"}`);
@@ -1748,9 +1780,9 @@ async function handleMessages(req, res) {
     );
   }
 
-  const candidateModels = [CONFIG.primaryModel, ...CONFIG.fallbackModels].filter(Boolean);
-  if (candidateModels.length === 0) {
-    candidateModels.push(body.model || DEFAULT_MODELS[0]);
+  const candidateTargets = [CONFIG.primaryTarget, ...CONFIG.fallbackTargets].filter(Boolean);
+  if (candidateTargets.length === 0) {
+    candidateTargets.push({ model: body.model || DEFAULT_MODELS[0], endpoint: null });
   }
 
   const wantsStream = body.stream === true;
@@ -1758,9 +1790,11 @@ async function handleMessages(req, res) {
   const upstreamContext = createUpstreamContext(res);
 
   try {
-    for (let modelIndex = 0; modelIndex < candidateModels.length; modelIndex++) {
-      const currentModel = candidateModels[modelIndex];
-      const hasNextFallback = modelIndex < candidateModels.length - 1;
+    for (let targetIndex = 0; targetIndex < candidateTargets.length; targetIndex++) {
+      const target = candidateTargets[targetIndex];
+      const currentModel = target.model;
+      const customEndpoint = target.endpoint;
+      const hasNextFallback = targetIndex < candidateTargets.length - 1;
       body.model = currentModel;
       const useResponses = isResponsesModel(currentModel);
       const upstreamPath = resolveUpstreamPath(currentModel, CONFIG.endpointMode);
@@ -1776,7 +1810,7 @@ async function handleMessages(req, res) {
             err.type = "invalid_request_error";
             throw err;
           }
-          upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
+          upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath, customEndpoint });
           let respBody;
           try {
             respBody = await upstream.json();
@@ -1831,7 +1865,7 @@ async function handleMessages(req, res) {
           err.type = "invalid_request_error";
           throw err;
         }
-        upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
+        upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath, customEndpoint });
 
         if (wantsStream) {
           await streamOpenAiAsAnthropic(upstream, res, currentModel, toolContextParts, upstreamContext);
@@ -1845,10 +1879,11 @@ async function handleMessages(req, res) {
         // Fallback to next model if error is transient and headers not sent
         const isTransient = RETRY_STATUS_CODES.has(error.status) || error.status === 504 || error.type === "proxy_error";
         if (hasNextFallback && isTransient && !res.headersSent && !res.destroyed && !upstreamContext.signal.aborted) {
-          const nextModel = candidateModels[modelIndex + 1];
+          const nextTarget = candidateTargets[targetIndex + 1];
+          const endpointNote = nextTarget.endpoint ? ` (${nextTarget.endpoint})` : "";
           console.warn(
             `${clrDim(formatTimestamp())}  ${clrYellow("↷")}  ` +
-            `${clrYellow(`Model failover: ${currentModel} failed (${error.status || error.message}) → switching to ${nextModel}`)}`
+            `${clrYellow(`Model failover: ${currentModel} failed (${error.status || error.message}) → switching to ${nextTarget.model}${endpointNote}`)}`
           );
           continue;
         }
@@ -2041,8 +2076,11 @@ function printBanner() {
   console.log(`   ${clrDim("✦  Mode     ")} ${clrBold(mode)}${overrideNote}`);
   console.log(`   ${clrDim("✦  Config   ")} ${clrDim(CONFIG.configPath)}`);
   console.log(`   ${clrDim("✦  Retry    ")} ${clrDim(`${CONFIG.retryMax}x backoff (base ${CONFIG.retryBaseMs}ms on 429/502/503)`)}`);
-  if (CONFIG.fallbackModels && CONFIG.fallbackModels.length > 0) {
-    console.log(`   ${clrDim("✦  Fallbacks")} ${clrDim(CONFIG.fallbackModels.join(", "))}`);
+  if (CONFIG.fallbackTargets && CONFIG.fallbackTargets.length > 0) {
+    const formattedFallbacks = CONFIG.fallbackTargets
+      .map((t) => (t.endpoint ? `${clrBold(t.model)} ${clrDim(`(${t.endpoint})`)}` : clrBold(t.model)))
+      .join(", ");
+    console.log(`   ${clrDim("✦  Fallbacks")} ${formattedFallbacks}`);
   }
   if (KEY_POOL.length > 1) {
     console.log(`   ${clrDim("✦  Key Pool ")} ${clrGreen(`${KEY_POOL.length} keys loaded`)} ${clrDim("(auto-rotating on 429)")}`);

@@ -168,7 +168,16 @@ async function showDiagnostics() {
   const state = getClaudeState();
   const isRunning = await checkProxyServerRunning();
   const envKeys = (process.env.OPENCODE_API_KEYS || process.env.OPENCODE_API_KEY || "").split(/[,;\s]+/).filter(Boolean);
-  const fallbacks = (process.env.FALLBACK_MODELS || "").split(/[,;\s]+/).filter(Boolean);
+  const fallbacks = (process.env.FALLBACK_MODELS || "")
+    .split(/[,;\s]+/)
+    .filter(Boolean)
+    .map((item) => {
+      if (item.includes("|")) {
+        const [m, e] = item.split("|");
+        return `${m.trim()} (${e.trim()})`;
+      }
+      return item.trim();
+    });
 
   console.log(`\n  ${cBold("Diagnostics Report:")}`);
   console.log(`  ${cDim("────────────────────────────────────────────────────────────")}`);
