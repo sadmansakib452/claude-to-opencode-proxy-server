@@ -167,6 +167,8 @@ function checkProxyServerRunning(port = DEFAULT_PORT) {
 async function showDiagnostics() {
   const state = getClaudeState();
   const isRunning = await checkProxyServerRunning();
+  const envKeys = (process.env.OPENCODE_API_KEYS || process.env.OPENCODE_API_KEY || "").split(/[,;\s]+/).filter(Boolean);
+  const fallbacks = (process.env.FALLBACK_MODELS || "").split(/[,;\s]+/).filter(Boolean);
 
   console.log(`\n  ${cBold("Diagnostics Report:")}`);
   console.log(`  ${cDim("────────────────────────────────────────────────────────────")}`);
@@ -175,6 +177,10 @@ async function showDiagnostics() {
   console.log(`  • Active ANTHROPIC_BASE_URL:       ${state.url ? cBold(state.url) : cDim("None (Official API)")}`);
   console.log(`  • Settings File Path:              ${cDim(state.settingsFile)}`);
   console.log(`  • Backup File Present:             ${state.backupExists ? cGreen("Yes") : cDim("No")}`);
+  console.log(`  • Configured API Keys:             ${envKeys.length > 1 ? cGreen(`${envKeys.length} keys in pool (auto-rotating)`) : envKeys.length === 1 ? cGreen("1 key configured") : cRed("Missing API Key")}`);
+  if (fallbacks.length > 0) {
+    console.log(`  • Fallback Models Chain:           ${cDim(fallbacks.join(", "))}`);
+  }
   console.log(`  • Local .env Config:               ${fs.existsSync(path.join(__dirname, "..", ".env")) ? cGreen("Found") : cRed("Missing (.env)")}`);
   console.log(`  ${cDim("────────────────────────────────────────────────────────────")}\n`);
 }

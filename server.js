@@ -128,16 +128,69 @@ function envValue(name, fallback) {
   return Object.prototype.hasOwnProperty.call(process.env, name) ? process.env[name] : fallback;
 }
 
+function parseCommaList(raw) {
+  if (!raw || typeof raw !== "string") return [];
+  return raw
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+class KeyPool {
+  constructor(keys = []) {
+    this.keys = Array.isArray(keys) ? [...keys] : [];
+    this.currentIndex = 0;
+    this.cooldowns = new Map();
+  }
+
+  get length() {
+    return this.keys.length;
+  }
+
+  getActiveKey(clientKey = "") {
+    if (this.keys.length === 0) return clientKey;
+    const now = Date.now();
+    for (let i = 0; i < this.keys.length; i++) {
+      const idx = (this.currentIndex + i) % this.keys.length;
+      const key = this.keys[idx];
+      const cooldownUntil = this.cooldowns.get(key) || 0;
+      if (now >= cooldownUntil) {
+        this.currentIndex = idx;
+        return key;
+      }
+    }
+    return this.keys[this.currentIndex];
+  }
+
+  markRateLimited(key, cooldownMs = 15000) {
+    if (key) {
+      this.cooldowns.set(key, Date.now() + cooldownMs);
+    }
+    if (this.keys.length > 1) {
+      this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+      return this.keys[this.currentIndex];
+    }
+    return null;
+  }
+}
+
 function loadConfig() {
   // Source of truth is .env — no config.json
+  const rawKeyString = envValue("OPENCODE_API_KEYS", envValue("OPENCODE_API_KEY", envValue("ANTHROPIC_API_KEY", "")));
+  const parsedKeys = parseCommaList(rawKeyString);
+  const primaryModel = envValue("MODEL", DEFAULT_MODELS[0]);
+  const fallbackModels = parseCommaList(envValue("FALLBACK_MODELS", ""));
+
   return {
     configPath: path.join(__dirname, ".env"),
     listenHost: envValue("CLAUDE_OPENCODE_PROXY_HOST", "127.0.0.1"),
     port: numberConfig("listen.port", envValue("CLAUDE_OPENCODE_PROXY_PORT", 8787), 8787, { integer: true, min: 1, max: 65535 }),
     upstreamEndpoint: envValue("ENDPOINT", "") || "",
     upstreamBaseUrl: normalizeBaseUrl(envValue("CLAUDE_OPENCODE_PROXY_UPSTREAM_BASE_URL", envValue("BASE_URL", DEFAULT_BASE_URL))),
-    primaryModel: envValue("MODEL", DEFAULT_MODELS[0]),
-    opencodeKey: envValue("OPENCODE_API_KEY", envValue("ANTHROPIC_API_KEY", "")),
+    primaryModel,
+    fallbackModels,
+    opencodeKey: parsedKeys[0] || "",
+    opencodeKeys: parsedKeys,
     reasoningCachePath: resolveMaybeRelative(
       envValue("CLAUDE_OPENCODE_REASONING_CACHE", DEFAULT_REASONING_CACHE_PATH),
       __dirname,
@@ -148,7 +201,7 @@ function loadConfig() {
     reasoningContentMode: envValue("CLAUDE_OPENCODE_REASONING_CONTENT", "auto"),
     requestBodyLimitBytes: numberConfig("requestBodyLimitBytes", envValue("CLAUDE_OPENCODE_REQUEST_BODY_LIMIT_BYTES", DEFAULT_REQUEST_BODY_LIMIT_BYTES), DEFAULT_REQUEST_BODY_LIMIT_BYTES, { integer: true, min: 1 }),
     upstreamTimeoutMs: numberConfig("upstreamTimeoutMs", envValue("CLAUDE_OPENCODE_UPSTREAM_TIMEOUT_MS", DEFAULT_UPSTREAM_TIMEOUT_MS), DEFAULT_UPSTREAM_TIMEOUT_MS, { integer: true, min: 0 }),
-    models: [envValue("MODEL", DEFAULT_MODELS[0])].filter(Boolean),
+    models: [primaryModel, ...fallbackModels].filter(Boolean),
     endpointMode: String(envValue("CLAUDE_OPENCODE_ENDPOINT_MODE", "auto")).toLowerCase(),
     retryMax: numberConfig("retryMax", envValue("CLAUDE_OPENCODE_RETRY_MAX", DEFAULT_RETRY_MAX), DEFAULT_RETRY_MAX, { integer: true, min: 0, max: 10 }),
     retryBaseMs: numberConfig("retryBaseMs", envValue("CLAUDE_OPENCODE_RETRY_BASE_MS", DEFAULT_RETRY_BASE_MS), DEFAULT_RETRY_BASE_MS, { integer: true, min: 0 }),
@@ -178,6 +231,7 @@ function resolveUpstreamPath(model, endpointMode) {
 }
 
 const CONFIG = loadConfig();
+const KEY_POOL = new KeyPool(CONFIG.opencodeKeys);
 const reasoningByToolCallId = new Map();
 const reasoningByAssistantText = new Map();
 const reasoningByToolContext = new Map();
@@ -1209,24 +1263,31 @@ function requestProcessShutdown(server) {
   });
 }
 
+function resolveFullUpstreamUrl(upstreamPathResolved) {
+  if (CONFIG.upstreamEndpoint && CONFIG.upstreamEndpoint.startsWith("http")) {
+    const isEndpointResponses = CONFIG.upstreamEndpoint.includes("/responses");
+    const isPathResponses = upstreamPathResolved === "/responses";
+    // If the configured endpoint matches the required path mode, use it:
+    if (isEndpointResponses === isPathResponses) {
+      return CONFIG.upstreamEndpoint;
+    }
+  }
+  return `${CONFIG.upstreamBaseUrl}${upstreamPathResolved}`;
+}
+
 async function callOpenCode(req, payload, upstreamContext, opts = {}) {
   // Global proxy: .env OPENCODE_API_KEY is always preferred.
   // Client-provided sk-ant- keys are Anthropic keys and will be rejected by opencode.
   // If no .env key is configured, fall back to whatever the client sent.
   const clientKey = requestAuthToken(req);
-  const upstreamApiKey = CONFIG.opencodeKey || clientKey || "";
+  let upstreamApiKey = KEY_POOL.getActiveKey(clientKey);
   if (!upstreamApiKey) {
     throw new Error(
       "Upstream API key is not set. Set OPENCODE_API_KEY in .env or ANTHROPIC_API_KEY in settings.",
     );
   }
   const upstreamPathResolved = opts.upstreamPath || "/chat/completions";
-  // If .env ENDPOINT is full URL (contains /responses or /chat), use it directly.
-  // NOTE: When ENDPOINT is a full URL, model-based auto-routing (resolveUpstreamPath /
-  // isResponsesModel) is bypassed — all models hit the single ENDPOINT URL regardless.
-  const fullUpstreamUrl = CONFIG.upstreamEndpoint && CONFIG.upstreamEndpoint.startsWith("http") && (CONFIG.upstreamEndpoint.includes("/responses") || CONFIG.upstreamEndpoint.includes("/chat"))
-    ? CONFIG.upstreamEndpoint
-    : `${CONFIG.upstreamBaseUrl}${upstreamPathResolved}`;
+  const fullUpstreamUrl = resolveFullUpstreamUrl(upstreamPathResolved);
 
   if (process.env.CLAUDE_OPENCODE_DEBUG) {
     console.log(`[upstream] key: set len=${upstreamApiKey.length} url=${fullUpstreamUrl} model=${payload.model || "?"}`);
@@ -1234,6 +1295,7 @@ async function callOpenCode(req, payload, upstreamContext, opts = {}) {
 
   const maxRetries = CONFIG.retryMax;
   let attempt = 0;
+  let keysRotatedThisAttempt = 0;
 
   while (true) {
     // Don't attempt if client already disconnected or timed out
@@ -1254,11 +1316,26 @@ async function callOpenCode(req, payload, upstreamContext, opts = {}) {
 
     if (response.ok) return response;
 
+    // Multi-key rotation on 429: instantly rotate to next key in pool if available
+    if (response.status === 429 && KEY_POOL.length > 1 && keysRotatedThisAttempt < KEY_POOL.length - 1) {
+      keysRotatedThisAttempt++;
+      const nextKey = KEY_POOL.markRateLimited(upstreamApiKey);
+      if (nextKey) {
+        console.warn(
+          `${clrDim(formatTimestamp())}  ${clrYellow("🔄")}  ` +
+          `${clrYellow(`Key rate-limited (429) — rotating to next key in pool (${KEY_POOL.currentIndex + 1}/${KEY_POOL.length})`)}`
+        );
+        upstreamApiKey = nextKey;
+        continue; // Immediate retry with rotated key
+      }
+    }
+
     // Retryable status codes: 429 (rate limit), 502 (bad gateway), 503 (service unavailable)
     const shouldRetry = RETRY_STATUS_CODES.has(response.status) && attempt < maxRetries;
     if (shouldRetry) {
       const waitMs = Math.min(CONFIG.retryBaseMs * Math.pow(2, attempt), CONFIG.retryMaxMs);
       attempt++;
+      keysRotatedThisAttempt = 0; // Reset key rotation counter for next backoff tier
       sessionStats.retries++;
       console.warn(
         `${clrDim(formatTimestamp())}  ${clrYellow("⟳")}  ` +
@@ -1670,101 +1747,114 @@ async function handleMessages(req, res) {
       `${clrYellow(`High context: ${rawMessageCount} messages in history. Run /compact in Claude Code to avoid upstream rate limits.`)}`
     );
   }
-  // Global proxy: override model with .env MODEL if set.
-  // Claude Code always sends its own model name; .env MODEL silently wins every request.
-  // Log only in debug mode to avoid noise on every request.
-  if (CONFIG.primaryModel && body.model !== CONFIG.primaryModel) {
-    if (process.env.CLAUDE_OPENCODE_DEBUG) {
-      console.log(`[model] override ${body.model} → ${CONFIG.primaryModel} (from .env)`);
-    }
-    body.model = CONFIG.primaryModel;
+
+  const candidateModels = [CONFIG.primaryModel, ...CONFIG.fallbackModels].filter(Boolean);
+  if (candidateModels.length === 0) {
+    candidateModels.push(body.model || DEFAULT_MODELS[0]);
   }
+
   const wantsStream = body.stream === true;
   const toolContextParts = currentToolContextParts(body.messages);
-  const useResponses = isResponsesModel(body.model);
-  const upstreamPath = resolveUpstreamPath(body.model, CONFIG.endpointMode);
   const upstreamContext = createUpstreamContext(res);
-  let upstream;
 
   try {
-    if (useResponses) {
-      const payload = anthropicToResponses(body, false);
-      // Guard: opencode returns 500 when input is empty. Return 400 early with a clear message.
-      if (!Array.isArray(payload.input) || payload.input.length === 0) {
-        const err = new Error("Responses API input is empty after translation — no user messages found.");
-        err.status = 400;
-        err.type = "invalid_request_error";
-        throw err;
-      }
-      upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
-      let respBody;
+    for (let modelIndex = 0; modelIndex < candidateModels.length; modelIndex++) {
+      const currentModel = candidateModels[modelIndex];
+      const hasNextFallback = modelIndex < candidateModels.length - 1;
+      body.model = currentModel;
+      const useResponses = isResponsesModel(currentModel);
+      const upstreamPath = resolveUpstreamPath(currentModel, CONFIG.endpointMode);
+      let upstream;
+
       try {
-        respBody = await upstream.json();
-      } catch (parseErr) {
-        const err = new Error(`Upstream returned non-JSON response: ${parseErr.message}`);
-        err.status = 502;
-        err.type = "proxy_error";
-        throw err;
-      }
-      const anthropicBody = responsesToAnthropic(respBody, body.model, toolContextParts);
-      if (wantsStream) {
-        // Simulate streaming for Responses API (upstream is always non-streaming here).
-        // Trade-off: the full upstream response is buffered before any SSE event is emitted,
-        // so time-to-first-token is higher than a true streaming path. This is a known
-        // limitation of the Responses API — it does not support streaming in this bridge.
-        res.writeHead(200, {
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-cache",
-          connection: "keep-alive",
-        });
-        writeMessageStart(res, body.model);
-        let idx = 0;
-        for (const block of anthropicBody.content) {
-          if (block.type === "thinking") {
-            contentBlockStart(res, idx, { type: "thinking", thinking: "", signature: "" });
-            contentBlockDelta(res, idx, { type: "thinking_delta", thinking: block.thinking });
-            contentBlockDelta(res, idx, { type: "signature_delta", signature: "" });
-            contentBlockStop(res, idx);
-          } else if (block.type === "text") {
-            contentBlockStart(res, idx, { type: "text", text: "" });
-            contentBlockDelta(res, idx, { type: "text_delta", text: block.text });
-            contentBlockStop(res, idx);
-          } else if (block.type === "tool_use") {
-            contentBlockStart(res, idx, { type: "tool_use", id: block.id, name: block.name, input: {} });
-            contentBlockDelta(res, idx, { type: "input_json_delta", partial_json: JSON.stringify(block.input) });
-            contentBlockStop(res, idx);
+        if (useResponses) {
+          const payload = anthropicToResponses(body, false);
+          // Guard: opencode returns 500 when input is empty. Return 400 early with a clear message.
+          if (!Array.isArray(payload.input) || payload.input.length === 0) {
+            const err = new Error("Responses API input is empty after translation — no user messages found.");
+            err.status = 400;
+            err.type = "invalid_request_error";
+            throw err;
           }
-          idx++;
+          upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
+          let respBody;
+          try {
+            respBody = await upstream.json();
+          } catch (parseErr) {
+            const err = new Error(`Upstream returned non-JSON response: ${parseErr.message}`);
+            err.status = 502;
+            err.type = "proxy_error";
+            throw err;
+          }
+          const anthropicBody = responsesToAnthropic(respBody, currentModel, toolContextParts);
+          if (wantsStream) {
+            res.writeHead(200, {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache",
+              connection: "keep-alive",
+            });
+            writeMessageStart(res, currentModel);
+            let idx = 0;
+            for (const block of anthropicBody.content) {
+              if (block.type === "thinking") {
+                contentBlockStart(res, idx, { type: "thinking", thinking: "", signature: "" });
+                contentBlockDelta(res, idx, { type: "thinking_delta", thinking: block.thinking });
+                contentBlockDelta(res, idx, { type: "signature_delta", signature: "" });
+                contentBlockStop(res, idx);
+              } else if (block.type === "text") {
+                contentBlockStart(res, idx, { type: "text", text: "" });
+                contentBlockDelta(res, idx, { type: "text_delta", text: block.text });
+                contentBlockStop(res, idx);
+              } else if (block.type === "tool_use") {
+                contentBlockStart(res, idx, { type: "tool_use", id: block.id, name: block.name, input: {} });
+                contentBlockDelta(res, idx, { type: "input_json_delta", partial_json: JSON.stringify(block.input) });
+                contentBlockStop(res, idx);
+              }
+              idx++;
+            }
+            sse(res, "message_delta", { type: "message_delta", delta: { stop_reason: anthropicBody.stop_reason, stop_sequence: null }, usage: anthropicBody.usage });
+            sse(res, "message_stop", { type: "message_stop" });
+            res.end();
+            return;
+          }
+          sendJson(res, 200, anthropicBody);
+          return;
         }
-        sse(res, "message_delta", { type: "message_delta", delta: { stop_reason: anthropicBody.stop_reason, stop_sequence: null }, usage: anthropicBody.usage });
-        sse(res, "message_stop", { type: "message_stop" });
-        res.end();
-        upstreamContext.cleanup();
+
+        // Legacy chat/completions path
+        const payload = anthropicToOpenAi(body, wantsStream);
+        // Guard: some upstreams return 400/500 when messages is empty or has only a system message.
+        const nonSystemMessages = (payload.messages || []).filter((m) => m.role !== "system");
+        if (nonSystemMessages.length === 0) {
+          const err = new Error("Chat Completions messages is empty after translation — no user or assistant messages found.");
+          err.status = 400;
+          err.type = "invalid_request_error";
+          throw err;
+        }
+        upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
+
+        if (wantsStream) {
+          await streamOpenAiAsAnthropic(upstream, res, currentModel, toolContextParts, upstreamContext);
+          return;
+        }
+
+        const openAiBody = await upstream.json();
+        sendJson(res, 200, openAiToAnthropic(openAiBody, currentModel, toolContextParts));
         return;
+      } catch (error) {
+        // Fallback to next model if error is transient and headers not sent
+        const isTransient = RETRY_STATUS_CODES.has(error.status) || error.status === 504 || error.type === "proxy_error";
+        if (hasNextFallback && isTransient && !res.headersSent && !res.destroyed && !upstreamContext.signal.aborted) {
+          const nextModel = candidateModels[modelIndex + 1];
+          console.warn(
+            `${clrDim(formatTimestamp())}  ${clrYellow("↷")}  ` +
+            `${clrYellow(`Model failover: ${currentModel} failed (${error.status || error.message}) → switching to ${nextModel}`)}`
+          );
+          continue;
+        }
+        throw error;
       }
-      sendJson(res, 200, anthropicBody);
-      return;
     }
-
-    // Legacy chat/completions path
-    const payload = anthropicToOpenAi(body, wantsStream);
-    // Guard: some upstreams return 400/500 when messages is empty or has only a system message.
-    const nonSystemMessages = (payload.messages || []).filter((m) => m.role !== "system");
-    if (nonSystemMessages.length === 0) {
-      const err = new Error("Chat Completions messages is empty after translation — no user or assistant messages found.");
-      err.status = 400;
-      err.type = "invalid_request_error";
-      throw err;
-    }
-    upstream = await callOpenCode(req, payload, upstreamContext, { upstreamPath });
-
-    if (wantsStream) {
-      await streamOpenAiAsAnthropic(upstream, res, body.model, toolContextParts, upstreamContext);
-      return;
-    }
-
-    const openAiBody = await upstream.json();
-    sendJson(res, 200, openAiToAnthropic(openAiBody, body.model, toolContextParts));
   } catch (error) {
     throw normalizeUpstreamError(error, upstreamContext);
   } finally {
@@ -1951,6 +2041,12 @@ function printBanner() {
   console.log(`   ${clrDim("✦  Mode     ")} ${clrBold(mode)}${overrideNote}`);
   console.log(`   ${clrDim("✦  Config   ")} ${clrDim(CONFIG.configPath)}`);
   console.log(`   ${clrDim("✦  Retry    ")} ${clrDim(`${CONFIG.retryMax}x backoff (base ${CONFIG.retryBaseMs}ms on 429/502/503)`)}`);
+  if (CONFIG.fallbackModels && CONFIG.fallbackModels.length > 0) {
+    console.log(`   ${clrDim("✦  Fallbacks")} ${clrDim(CONFIG.fallbackModels.join(", "))}`);
+  }
+  if (KEY_POOL.length > 1) {
+    console.log(`   ${clrDim("✦  Key Pool ")} ${clrGreen(`${KEY_POOL.length} keys loaded`)} ${clrDim("(auto-rotating on 429)")}`);
+  }
 
   if (claudeState.state === "linked") {
     console.log(`   ${clrDim("✦  Claude   ")} ${clrGreen("✔ " + claudeState.label)}`);
