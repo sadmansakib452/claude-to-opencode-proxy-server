@@ -57,6 +57,13 @@ const DEFAULT_REQUEST_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const CHAT_COMPLETIONS_RESPONSE_HEADERS = ["content-type", "cache-control"];
 const warnedFinishReasons = new Set();
+const DEFAULT_RETRY_MAX = 3;
+const DEFAULT_RETRY_BASE_MS = 1500;
+const DEFAULT_RETRY_MAX_MS = 15000;
+const RETRY_STATUS_CODES = new Set([429, 502, 503]);
+const DEFAULT_CONTEXT_WARN_THRESHOLD = 200;
+// In-memory session stats (reset on server restart)
+const sessionStats = { retries: 0, errors: 0, startedAt: Date.now() };
 
 function readJson(file) {
   try {
@@ -143,6 +150,10 @@ function loadConfig() {
     upstreamTimeoutMs: numberConfig("upstreamTimeoutMs", envValue("CLAUDE_OPENCODE_UPSTREAM_TIMEOUT_MS", DEFAULT_UPSTREAM_TIMEOUT_MS), DEFAULT_UPSTREAM_TIMEOUT_MS, { integer: true, min: 0 }),
     models: [envValue("MODEL", DEFAULT_MODELS[0])].filter(Boolean),
     endpointMode: String(envValue("CLAUDE_OPENCODE_ENDPOINT_MODE", "auto")).toLowerCase(),
+    retryMax: numberConfig("retryMax", envValue("CLAUDE_OPENCODE_RETRY_MAX", DEFAULT_RETRY_MAX), DEFAULT_RETRY_MAX, { integer: true, min: 0, max: 10 }),
+    retryBaseMs: numberConfig("retryBaseMs", envValue("CLAUDE_OPENCODE_RETRY_BASE_MS", DEFAULT_RETRY_BASE_MS), DEFAULT_RETRY_BASE_MS, { integer: true, min: 0 }),
+    retryMaxMs: numberConfig("retryMaxMs", envValue("CLAUDE_OPENCODE_RETRY_MAX_MS", DEFAULT_RETRY_MAX_MS), DEFAULT_RETRY_MAX_MS, { integer: true, min: 0 }),
+    contextWarnThreshold: numberConfig("contextWarnThreshold", envValue("CLAUDE_OPENCODE_CONTEXT_WARN_THRESHOLD", DEFAULT_CONTEXT_WARN_THRESHOLD), DEFAULT_CONTEXT_WARN_THRESHOLD, { integer: true, min: 0 }),
   };
 }
 
@@ -1216,30 +1227,64 @@ async function callOpenCode(req, payload, upstreamContext, opts = {}) {
   const fullUpstreamUrl = CONFIG.upstreamEndpoint && CONFIG.upstreamEndpoint.startsWith("http") && (CONFIG.upstreamEndpoint.includes("/responses") || CONFIG.upstreamEndpoint.includes("/chat"))
     ? CONFIG.upstreamEndpoint
     : `${CONFIG.upstreamBaseUrl}${upstreamPathResolved}`;
-  console.log(`[upstream] key: set len=${upstreamApiKey.length} url=${fullUpstreamUrl} model=${payload.model || "?"}`);
-  const response = await fetch(fullUpstreamUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${upstreamApiKey}`,
-      "content-type": "application/json",
-    },
-    signal: upstreamContext.signal,
-    body: JSON.stringify(payload),
-  }).catch((error) => {
-    if (upstreamContext.signal.aborted) throw makeAbortError(upstreamContext);
-    throw error;
-  });
 
-  if (!response.ok) {
+  if (process.env.CLAUDE_OPENCODE_DEBUG) {
+    console.log(`[upstream] key: set len=${upstreamApiKey.length} url=${fullUpstreamUrl} model=${payload.model || "?"}`);
+  }
+
+  const maxRetries = CONFIG.retryMax;
+  let attempt = 0;
+
+  while (true) {
+    // Don't attempt if client already disconnected or timed out
+    if (upstreamContext.signal.aborted) throw makeAbortError(upstreamContext);
+
+    const response = await fetch(fullUpstreamUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${upstreamApiKey}`,
+        "content-type": "application/json",
+      },
+      signal: upstreamContext.signal,
+      body: JSON.stringify(payload),
+    }).catch((error) => {
+      if (upstreamContext.signal.aborted) throw makeAbortError(upstreamContext);
+      throw error;
+    });
+
+    if (response.ok) return response;
+
+    // Retryable status codes: 429 (rate limit), 502 (bad gateway), 503 (service unavailable)
+    const shouldRetry = RETRY_STATUS_CODES.has(response.status) && attempt < maxRetries;
+    if (shouldRetry) {
+      const waitMs = Math.min(CONFIG.retryBaseMs * Math.pow(2, attempt), CONFIG.retryMaxMs);
+      attempt++;
+      sessionStats.retries++;
+      console.warn(
+        `${clrDim(formatTimestamp())}  ${clrYellow("⟳")}  ` +
+        `${clrYellow(`upstream ${response.status} — retrying in ${(waitMs / 1000).toFixed(1)}s`)} ` +
+        `${clrDim(`(attempt ${attempt}/${maxRetries}  model:${payload.model || "?"})`)}`
+      );
+      // Wait with abort awareness — bail immediately if client disconnects during wait
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, waitMs);
+        upstreamContext.signal.addEventListener("abort", () => {
+          clearTimeout(t);
+          reject(makeAbortError(upstreamContext));
+        }, { once: true });
+      });
+      continue;
+    }
+
+    // Non-retryable or exhausted retries — throw with full context
     const text = await response.text();
     console.error(`Upstream payload summary: ${JSON.stringify(payloadDebugSummary(payload))} path=${upstreamPathResolved}`);
+    sessionStats.errors++;
     const error = new Error(`OpenCode Go returned ${response.status}: ${text}`);
     error.status = response.status;
     error.type = response.status >= 500 ? "proxy_error" : "upstream_error";
     throw error;
   }
-
-  return response;
 }
 
 function sse(res, event, data) {
@@ -1335,9 +1380,13 @@ function logRequestError(req, status, error) {
   const message = error && error.message ? error.message : String(error);
   const method  = (req.method || "?").padEnd(5);
   const pathname = parsedPathname(req).padEnd(22);
+  const isClientCancel = status === 499;
+  const icon = isClientCancel ? clrYellow("–") : clrRed("✖");
+  const coloredStatus = isClientCancel ? clrYellow(String(status)) : clrRed(String(status));
+  const displayMsg = isClientCancel ? "Client cancelled request" : message;
   console.error(
-    `${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrBold(method)}${clrDim(pathname)} ` +
-    `${clrRed(String(status))}  ${clrDim(message)}`
+    `${clrDim(formatTimestamp())}  ${icon}  ${clrBold(method)}${clrDim(pathname)} ` +
+    `${coloredStatus}  ${clrDim(displayMsg)}`
   );
 }
 
@@ -1614,6 +1663,13 @@ async function streamOpenAiAsAnthropic(upstream, res, model, toolContextParts = 
 
 async function handleMessages(req, res) {
   const body = await readJsonBody(req);
+  const rawMessageCount = Array.isArray(body.messages) ? body.messages.length : 0;
+  if (CONFIG.contextWarnThreshold > 0 && rawMessageCount >= CONFIG.contextWarnThreshold) {
+    console.warn(
+      `${clrDim(formatTimestamp())}  ${clrYellow("⚠")}  ` +
+      `${clrYellow(`High context: ${rawMessageCount} messages in history. Run /compact in Claude Code to avoid upstream rate limits.`)}`
+    );
+  }
   // Global proxy: override model with .env MODEL if set.
   // Claude Code always sends its own model name; .env MODEL silently wins every request.
   // Log only in debug mode to avoid noise on every request.
@@ -1894,6 +1950,7 @@ function printBanner() {
   console.log(`   ${clrDim("✦  Upstream ")} ${clrBold(effectiveUpstream)}`);
   console.log(`   ${clrDim("✦  Mode     ")} ${clrBold(mode)}${overrideNote}`);
   console.log(`   ${clrDim("✦  Config   ")} ${clrDim(CONFIG.configPath)}`);
+  console.log(`   ${clrDim("✦  Retry    ")} ${clrDim(`${CONFIG.retryMax}x backoff (base ${CONFIG.retryBaseMs}ms on 429/502/503)`)}`);
 
   if (claudeState.state === "linked") {
     console.log(`   ${clrDim("✦  Claude   ")} ${clrGreen("✔ " + claudeState.label)}`);
