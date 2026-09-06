@@ -2005,10 +2005,13 @@ function installShutdownHandlers(server) {
   const shutdown = (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`Received ${signal}; flushing reasoning cache and shutting down.`);
+    console.log("");
+    console.log(`  ${clrYellow("🛑")}  ${clrBold("Shutting down proxy server...")}`);
     flushReasoningCache();
+    console.log(`  ${clrGreen("✨")}  ${clrDim("Reasoning cache saved safely to disk.")}`);
+    console.log(`  ${clrCyan("👋")}  ${clrBold("Proxy stopped gracefully. Goodbye!")}\n`);
     server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 5000).unref();
+    setTimeout(() => process.exit(0), 1000).unref();
   };
 
   process.on("SIGINT", () => shutdown("SIGINT"));
@@ -2118,19 +2121,65 @@ function startServer() {
   installShutdownHandlers(server);
 
   // Handle port-in-use and other listen errors with a clear message.
-  server.on("error", (error) => {
+  server.on("error", async (error) => {
     if (error.code === "EADDRINUSE") {
+      // Fast probe to check if our own proxy is already responding on this port
+      const isOurProxy = await new Promise((resolve) => {
+        const probeReq = http.request(
+          {
+            host: CONFIG.listenHost,
+            port: CONFIG.port,
+            path: "/health",
+            method: "GET",
+            timeout: 800,
+          },
+          (res) => {
+            let data = "";
+            res.on("data", (chunk) => { data += chunk; });
+            res.on("end", () => {
+              try {
+                const parsed = JSON.parse(data);
+                resolve(parsed && parsed.ok === true);
+              } catch {
+                resolve(false);
+              }
+            });
+          }
+        );
+        probeReq.on("error", () => resolve(false));
+        probeReq.on("timeout", () => { probeReq.destroy(); resolve(false); });
+        probeReq.end();
+      });
+
+      if (isOurProxy) {
+        console.log("");
+        console.log(clrCyan("  ╔══════════════════════════════════════════════════════════╗"));
+        console.log(clrCyan("  ║") + clrBold("   ⚡ Proxy is Already Active in the Background!          ") + clrCyan("║"));
+        console.log(clrCyan("  ╚══════════════════════════════════════════════════════════╝"));
+        console.log("");
+        console.log(`   ${clrDim("✦  Port     ")} ${clrGreen(clrBold(`http://${CONFIG.listenHost}:${CONFIG.port}`))}`);
+        console.log(`   ${clrDim("✦  Status   ")} ${clrGreen("Running & Healthy (Background Service)")}`);
+        console.log(`   ${clrDim("✦  Notice   ")} ${clrYellow("You DO NOT need to keep this terminal open.")}`);
+        console.log(`   ${clrDim("✦  Claude   ")} ${clrDim("Ready to code right now!")}`);
+        console.log("");
+        console.log(`   ${clrDim("💡 Tips:")}`);
+        console.log(`     • Stop background service:  ${clrBold("npm run service:stop")}`);
+        console.log(`     • Service diagnostics:      ${clrBold("npm run status")}`);
+        console.log("");
+        process.exit(0);
+      }
+
       console.error(
-        `${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Port ${CONFIG.port} is already in use. Is another instance running?`)}\n` +
-        `       ${clrDim(`Change CLAUDE_OPENCODE_PROXY_PORT in .env to use a different port.`)}`
+        `\n${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Port ${CONFIG.port} is already in use by another application.`)}\n` +
+        `       ${clrDim(`Change CLAUDE_OPENCODE_PROXY_PORT in .env to use a different port.`)}\n`
       );
     } else if (error.code === "EACCES") {
       console.error(
-        `${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Permission denied to listen on port ${CONFIG.port}.`)}\n` +
-        `       ${clrDim(`Use a port > 1024 or run with elevated privileges.`)}`
+        `\n${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Permission denied to listen on port ${CONFIG.port}.`)}\n` +
+        `       ${clrDim(`Use a port > 1024 or run with elevated privileges.`)}\n`
       );
     } else {
-      console.error(`${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Server error: ${error.message}`)}`);
+      console.error(`\n${clrDim(formatTimestamp())}  ${clrRed("✖")}  ${clrRed(`[error] Server error: ${error.message}`)}\n`);
     }
     flushReasoningCache();
     process.exit(1);

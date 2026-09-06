@@ -4,6 +4,7 @@ const path = require("path");
 const os = require("os");
 const readline = require("readline");
 const http = require("http");
+const { spawnSync } = require("child_process");
 
 // Load local proxy .env if present
 try { require("dotenv").config({ quiet: true }); } catch {}
@@ -164,6 +165,80 @@ function checkProxyServerRunning(port = DEFAULT_PORT) {
   });
 }
 
+function getWindowsServiceStatus() {
+  if (process.platform !== "win32") return { supported: false, installed: false, running: false };
+  try {
+    const res = spawnSync(
+      "powershell",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "$t = Get-ScheduledTask -TaskName 'DeepSeekV4OpenCodeClaudeCodeBridge' -ErrorAction SilentlyContinue; if ($t) { Write-Output ($t.State.ToString()) } else { Write-Output 'NotFound' }",
+      ],
+      { encoding: "utf8", timeout: 3000 }
+    );
+    const output = (res.stdout || "").trim();
+    if (!output || output === "NotFound") {
+      return { supported: true, installed: false, running: false, state: "Not Installed" };
+    }
+    return {
+      supported: true,
+      installed: true,
+      running: output === "Ready" || output === "Running",
+      state: output,
+    };
+  } catch {
+    return { supported: true, installed: false, running: false, state: "Unknown" };
+  }
+}
+
+function installWindowsService() {
+  if (process.platform !== "win32") {
+    console.log(`\n  ${cYellow("⚠️")} Automatic service installation is configured for Windows.\n`);
+    return;
+  }
+  console.log(`\n  ${cCyan("⚡")} ${cBold("Installing Windows Background Service...")}`);
+  console.log(`  ${cDim("Registering Windows Scheduled Task to autostart proxy silently at logon...")}\n`);
+  const scriptPath = path.join(__dirname, "install-autostart-windows.ps1");
+  const res = spawnSync("powershell", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath
+  ], { stdio: "inherit" });
+  if (res.status === 0) {
+    console.log(`\n  ${cGreen("✔")} ${cBold("Windows Background Service installed successfully!")}`);
+    console.log(`  ${cDim("The proxy will run automatically on Windows boot. No terminal required.")}\n`);
+  } else {
+    console.log(`\n  ${cRed("✖")} ${cBold("Failed to install service. Try running as Administrator.")}\n`);
+  }
+}
+
+function uninstallWindowsService() {
+  if (process.platform !== "win32") {
+    console.log(`\n  ${cYellow("⚠️")} Automatic service uninstallation is configured for Windows.\n`);
+    return;
+  }
+  console.log(`\n  ${cYellow("🗑️")}  ${cBold("Uninstalling Windows Background Service...")}`);
+  console.log(`  ${cDim("Stopping and removing Windows Scheduled Task...")}\n`);
+  const scriptPath = path.join(__dirname, "uninstall-autostart-windows.ps1");
+  const res = spawnSync("powershell", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath
+  ], { stdio: "inherit" });
+  if (res.status === 0) {
+    console.log(`\n  ${cGreen("✔")} ${cBold("Windows Background Service removed successfully.")}\n`);
+  } else {
+    console.log(`\n  ${cRed("✖")} ${cBold("Failed to uninstall service.")}\n`);
+  }
+}
+
 async function showDiagnostics() {
   const state = getClaudeState();
   const isRunning = await checkProxyServerRunning();
@@ -178,6 +253,7 @@ async function showDiagnostics() {
       }
       return item.trim();
     });
+  const service = getWindowsServiceStatus();
 
   console.log(`\n  ${cBold("Diagnostics Report:")}`);
   console.log(`  ${cDim("────────────────────────────────────────────────────────────")}`);
@@ -189,6 +265,12 @@ async function showDiagnostics() {
   console.log(`  • Configured API Keys:             ${envKeys.length > 1 ? cGreen(`${envKeys.length} keys in pool (auto-rotating)`) : envKeys.length === 1 ? cGreen("1 key configured") : cRed("Missing API Key")}`);
   if (fallbacks.length > 0) {
     console.log(`  • Fallback Models Chain:           ${cDim(fallbacks.join(", "))}`);
+  }
+  if (service.supported) {
+    const serviceLabel = service.installed
+      ? (service.running ? cGreen(`Installed (● Running - ${service.state})`) : cYellow(`Installed (○ ${service.state})`))
+      : cDim("Not Installed");
+    console.log(`  • Windows Background Service:      ${serviceLabel}`);
   }
   console.log(`  • Local .env Config:               ${fs.existsSync(path.join(__dirname, "..", ".env")) ? cGreen("Found") : cRed("Missing (.env)")}`);
   console.log(`  ${cDim("────────────────────────────────────────────────────────────")}\n`);
@@ -205,17 +287,23 @@ function showBanner() {
 async function runInteractiveMenu() {
   showBanner();
   const state = getClaudeState();
+  const service = getWindowsServiceStatus();
 
   console.log(`  ${cDim("Current Status:")}`);
   console.log(`  • Claude CLI State: ${state.state === "linked" ? cGreen(state.label) : cYellow(state.label)}`);
   console.log(`  • Target Proxy URL: ${cBold(PROXY_URL)}`);
+  if (service.supported) {
+    console.log(`  • Background Task:  ${service.installed ? cGreen(`Installed (${service.state})`) : cDim("Not Installed")}`);
+  }
   console.log(`  • Backup Available: ${state.backupExists ? cGreen("Yes") : cDim("No")}`);
   console.log("");
   console.log(`  ${cBold("Select an option:")}`);
   console.log(`    ${cBold("1)")} 🚀 ${cGreen("Connect Claude to Proxy")} (Safe Backup & Switch)`);
   console.log(`    ${cBold("2)")} 🔄 ${cYellow("Restore Official Claude Settings")} (Detach Proxy)`);
-  console.log(`    ${cBold("3)")} 🔍 Run Diagnostics`);
-  console.log(`    ${cBold("4)")} ❌ Exit`);
+  console.log(`    ${cBold("3)")} ⚡ ${cCyan("Install Silent Windows Service")} (Always On, No Terminal)`);
+  console.log(`    ${cBold("4)")} 🗑️  ${cDim("Uninstall Windows Background Service")}`);
+  console.log(`    ${cBold("5)")} 🔍 Run Diagnostics & Status`);
+  console.log(`    ${cBold("0)")} ❌ Exit`);
   console.log("");
 
   const rl = readline.createInterface({
@@ -223,7 +311,7 @@ async function runInteractiveMenu() {
     output: process.stdout,
   });
 
-  rl.question(`  ${cBold("Enter choice [1-4]: ")}`, async (answer) => {
+  rl.question(`  ${cBold("Enter choice [0-5]: ")}`, async (answer) => {
     rl.close();
     const choice = (answer || "").trim();
     if (choice === "1") {
@@ -231,6 +319,10 @@ async function runInteractiveMenu() {
     } else if (choice === "2") {
       restoreOfficialClaude();
     } else if (choice === "3") {
+      installWindowsService();
+    } else if (choice === "4") {
+      uninstallWindowsService();
+    } else if (choice === "5") {
       await showDiagnostics();
     } else {
       console.log(`\n  ${cDim("Exited without changes.")}\n`);
@@ -249,6 +341,12 @@ if (args.includes("--restore")) {
 } else if (args.includes("--connect")) {
   showBanner();
   connectToProxy();
+} else if (args.includes("--install-service")) {
+  showBanner();
+  installWindowsService();
+} else if (args.includes("--uninstall-service")) {
+  showBanner();
+  uninstallWindowsService();
 } else {
   runInteractiveMenu();
 }
